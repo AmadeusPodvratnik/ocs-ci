@@ -4,6 +4,8 @@ Module for version related util functions.
 """
 import logging
 import re
+import time
+
 import requests
 from semantic_version import Version
 import yaml
@@ -150,32 +152,67 @@ def get_ocp_version(seperator=None):
     return char.join([str(version.major), str(version.minor)])
 
 
-def get_ocp_ga_version(channel):
+def get_ocp_ga_version(channel, retries=3, retry_delay=10):
     """
-    Retrieve the latest GA version for
+    Retrieve the latest GA version for a given OCP channel.
+
+    Retries the request on transient failures (network errors, non-2xx
+    responses).  Returns an empty string if all attempts are exhausted or
+    the channel contains no nodes.
 
     Args:
         channel (str): the OCP version channel to retrieve GA version for
+        retries (int): number of attempts before giving up (default: 3)
+        retry_delay (int): seconds to wait between attempts (default: 10)
 
     Returns:
         str: latest GA version for the provided channel.
-            An empty string is returned if no version exists.
-
-
+            An empty string is returned if no version exists or all
+            attempts fail.
     """
     log.debug("Retrieving GA version for channel: %s", channel)
     url = "https://api.openshift.com/api/upgrades_info/v1/graph"
     headers = {"Accept": "application/json"}
     payload = {"channel": f"stable-{channel}"}
-    r = requests.get(url, headers=headers, params=payload, timeout=120)
-    nodes = r.json()["nodes"]
-    if nodes:
-        versions = [node["version"] for node in nodes]
-        versions.sort()
-        ga_version = versions[-1]
-        log.debug("Found GA version: %s", ga_version)
-        return ga_version
-    log.debug("No GA version found")
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=headers, params=payload, timeout=120)
+            if not r.ok:
+                log.warning(
+                    "get_ocp_ga_version: attempt %d/%d received HTTP %d (%s)",
+                    attempt,
+                    retries,
+                    r.status_code,
+                    r.text[:200],
+                )
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                continue
+            nodes = r.json().get("nodes", [])
+            if nodes:
+                versions = [node["version"] for node in nodes]
+                versions.sort()
+                ga_version = versions[-1]
+                log.debug("Found GA version: %s", ga_version)
+                return ga_version
+            log.debug("No GA version found")
+            return ""
+        except requests.exceptions.RequestException as e:
+            log.warning(
+                "get_ocp_ga_version: attempt %d/%d failed with exception: %s",
+                attempt,
+                retries,
+                e,
+            )
+            if attempt < retries:
+                time.sleep(retry_delay)
+
+    log.error(
+        "get_ocp_ga_version: all %d attempts failed for channel '%s', returning empty string",
+        retries,
+        channel,
+    )
     return ""
 
 
